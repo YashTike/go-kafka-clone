@@ -7,17 +7,19 @@ import (
 	"testing"
 
 	api "github.com/YashTike/proglog/api/v1"
-	"github.com/YashTike/proglog/internal/log"
+	config "github.com/YashTike/proglog/internal/config"
+	log "github.com/YashTike/proglog/internal/log"
+
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
 
 func TestServer(t *testing.T) {
 	for scenario, fn := range map[string]func(t *testing.T, client api.LogClient, config *Config){
 		"produce/consume a message to/from the log succeeds": testProduceConsume,
-		"produce/consume stream succeeds":                   testProduceConsumeStream,
+		"produce/consume stream succeeds":                    testProduceConsumeStream,
 		"consume past log boundary fails":                    testConsumePastBoundary,
 	} {
 		t.Run(scenario, func(t *testing.T) {
@@ -28,16 +30,32 @@ func TestServer(t *testing.T) {
 	}
 }
 
-func setupTest(t *testing.T, fn func(*Config)) (client api.LogClient, config *Config, teardown func()) {
+func setupTest(t *testing.T, fn func(*Config)) (client api.LogClient, conf *Config, teardown func()) {
 	t.Helper()
 
-	l, err := net.Listen("tcp", ":0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	clientOptions := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials()),}
-	cc, err := grpc.NewClient(l.Addr().String(), clientOptions...)
+	clientTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CAFile: config.CAFile,
+	})
 	require.NoError(t, err)
 
+	clientCreds := credentials.NewTLS(clientTLSConfig)
+	cc, err := grpc.NewClient(l.Addr().String(), grpc.WithTransportCredentials(clientCreds))
+	require.NoError(t, err)
+
+	client = api.NewLogClient(cc)
+
+	serverTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile:      config.ServerCertFile,
+		KeyFile:       config.ServerKeyFile,
+		CAFile:        config.CAFile,
+		ServerAddress: l.Addr().String(),
+	})
+	require.NoError(t, err)
+
+	serverCreds := credentials.NewTLS(serverTLSConfig)
 	dir, err := os.MkdirTemp("", "server-test")
 	require.NoError(t, err)
 
@@ -47,28 +65,27 @@ func setupTest(t *testing.T, fn func(*Config)) (client api.LogClient, config *Co
 	cfg := &Config{
 		CommitLog: clog,
 	}
+
 	if fn != nil {
 		fn(cfg)
 	}
 
-	server, err := NewGRPCServer(cfg)
+	server, err := NewGRPCServer(cfg, grpc.Creds(serverCreds))
 	require.NoError(t, err)
 
 	go func() {
 		server.Serve(l)
 	}()
 
-	client = api.NewLogClient(cc)
-
 	return client, cfg, func() {
 		server.Stop()
 		cc.Close()
 		l.Close()
-		clog.Remove()
 	}
 }
 
 func testProduceConsume(t *testing.T, client api.LogClient, config *Config) {
+
 	ctx := context.Background()
 	want := &api.Record{
 		Value: []byte("hello, world"),
@@ -134,4 +151,3 @@ func testProduceConsumeStream(t *testing.T, client api.LogClient, config *Config
 		}
 	}
 }
-
